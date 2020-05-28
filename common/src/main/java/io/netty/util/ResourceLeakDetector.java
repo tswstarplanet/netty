@@ -17,6 +17,7 @@
 package io.netty.util;
 
 import io.netty.util.internal.EmptyArrays;
+import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -48,7 +49,12 @@ public class ResourceLeakDetector<T> {
     private static final String PROP_TARGET_RECORDS = "io.netty.leakDetection.targetRecords";
     private static final int DEFAULT_TARGET_RECORDS = 4;
 
+    private static final String PROP_SAMPLING_INTERVAL = "io.netty.leakDetection.samplingInterval";
+    // There is a minor performance benefit in TLR if this is a power of 2.
+    private static final int DEFAULT_SAMPLING_INTERVAL = 128;
+
     private static final int TARGET_RECORDS;
+    static final int SAMPLING_INTERVAL;
 
     /**
      * Represents the level of resource leak detection.
@@ -117,6 +123,7 @@ public class ResourceLeakDetector<T> {
         Level level = Level.parseLevel(levelStr);
 
         TARGET_RECORDS = SystemPropertyUtil.getInt(PROP_TARGET_RECORDS, DEFAULT_TARGET_RECORDS);
+        SAMPLING_INTERVAL = SystemPropertyUtil.getInt(PROP_SAMPLING_INTERVAL, DEFAULT_SAMPLING_INTERVAL);
 
         ResourceLeakDetector.level = level;
         if (logger.isDebugEnabled()) {
@@ -124,9 +131,6 @@ public class ResourceLeakDetector<T> {
             logger.debug("-D{}: {}", PROP_TARGET_RECORDS, TARGET_RECORDS);
         }
     }
-
-    // There is a minor performance benefit in TLR if this is a power of 2.
-    static final int DEFAULT_SAMPLING_INTERVAL = 128;
 
     /**
      * @deprecated Use {@link #setLevel(Level)} instead.
@@ -147,10 +151,7 @@ public class ResourceLeakDetector<T> {
      * Sets the resource leak detection level.
      */
     public static void setLevel(Level level) {
-        if (level == null) {
-            throw new NullPointerException("level");
-        }
-        ResourceLeakDetector.level = level;
+        ResourceLeakDetector.level = ObjectUtil.checkNotNull(level, "level");
     }
 
     /**
@@ -165,7 +166,8 @@ public class ResourceLeakDetector<T> {
             Collections.newSetFromMap(new ConcurrentHashMap<DefaultResourceLeak<?>, Boolean>());
 
     private final ReferenceQueue<Object> refQueue = new ReferenceQueue<Object>();
-    private final ConcurrentMap<String, Boolean> reportedLeaks = PlatformDependent.newConcurrentHashMap();
+    private final Set<String> reportedLeaks =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     private final String resourceType;
     private final int samplingInterval;
@@ -217,11 +219,7 @@ public class ResourceLeakDetector<T> {
      */
     @Deprecated
     public ResourceLeakDetector(String resourceType, int samplingInterval, long maxActive) {
-        if (resourceType == null) {
-            throw new NullPointerException("resourceType");
-        }
-
-        this.resourceType = resourceType;
+        this.resourceType = ObjectUtil.checkNotNull(resourceType, "resourceType");
         this.samplingInterval = samplingInterval;
     }
 
@@ -268,7 +266,6 @@ public class ResourceLeakDetector<T> {
 
     private void clearRefQueue() {
         for (;;) {
-            @SuppressWarnings("unchecked")
             DefaultResourceLeak ref = (DefaultResourceLeak) refQueue.poll();
             if (ref == null) {
                 break;
@@ -277,15 +274,24 @@ public class ResourceLeakDetector<T> {
         }
     }
 
+    /**
+     * When the return value is {@code true}, {@link #reportTracedLeak} and {@link #reportUntracedLeak}
+     * will be called once a leak is detected, otherwise not.
+     *
+     * @return {@code true} to enable leak reporting.
+     */
+    protected boolean needReport() {
+        return logger.isErrorEnabled();
+    }
+
     private void reportLeak() {
-        if (!logger.isErrorEnabled()) {
+        if (!needReport()) {
             clearRefQueue();
             return;
         }
 
         // Detect and report previous leaks.
         for (;;) {
-            @SuppressWarnings("unchecked")
             DefaultResourceLeak ref = (DefaultResourceLeak) refQueue.poll();
             if (ref == null) {
                 break;
@@ -296,7 +302,7 @@ public class ResourceLeakDetector<T> {
             }
 
             String records = ref.toString();
-            if (reportedLeaks.putIfAbsent(records, Boolean.TRUE) == null) {
+            if (reportedLeaks.add(records)) {
                 if (records.isEmpty()) {
                     reportUntracedLeak(resourceType);
                 } else {
@@ -313,7 +319,7 @@ public class ResourceLeakDetector<T> {
     protected void reportTracedLeak(String resourceType, String records) {
         logger.error(
                 "LEAK: {}.release() was not called before it's garbage-collected. " +
-                "See http://netty.io/wiki/reference-counted-objects.html for more information.{}",
+                "See https://netty.io/wiki/reference-counted-objects.html for more information.{}",
                 resourceType, records);
     }
 
@@ -326,7 +332,7 @@ public class ResourceLeakDetector<T> {
                 "Enable advanced leak reporting to find out where the leak occurred. " +
                 "To enable advanced leak reporting, " +
                 "specify the JVM option '-D{}={}' or call {}.setLevel() " +
-                "See http://netty.io/wiki/reference-counted-objects.html for more information.",
+                "See https://netty.io/wiki/reference-counted-objects.html for more information.",
                 resourceType, PROP_LEVEL, Level.ADVANCED.name().toLowerCase(), simpleClassName(this));
     }
 
@@ -495,8 +501,9 @@ public class ResourceLeakDetector<T> {
          */
         private static void reachabilityFence0(Object ref) {
             if (ref != null) {
-                // Empty synchronized is ok: https://stackoverflow.com/a/31933260/1151521
-                synchronized (ref) { }
+                synchronized (ref) {
+                    // Empty synchronized is ok: https://stackoverflow.com/a/31933260/1151521
+                }
             }
         }
 
